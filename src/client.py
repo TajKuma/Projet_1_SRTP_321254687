@@ -1,62 +1,213 @@
+import argparse
 import socket
+import sys
+import time 
+import urllib.parse
+from collections import deque
+from srtp_encode_decode import SRTPPacket
 
-def encode(packet_type, window, length, seqnum):
+class RTTEstimator:
 
-    if packet_type not in (1, 2, 3):
-        print("Sending invalid packet type")
-    if not (0 <= window < 2**6):
-        print("Invalid Winow value")
-        pass
-    if not (0 <= length <= 1024):
-        print("Invalid packet length, will be ignored upon recieve")
-    if not (0 <= seqnum < 2**11):
-        print("Error, seqnum should be a value between 0 & 2047")
-        pass
-
-    header = 0
-    header |= (packet_type & 0b11) << 30
-    header |= (window & 0b111111) << 24
-    header |= (length & 0x1FFF) << 11
-    header |= (seqnum & 0x7FF)
-
-    return f"{header:08X}"
-
-def decode(header):
-    """
-    Returns validity, P_TYPE as a string and window, length and seqnum as integer.
-    If validity is false, the packet should be ignored
-    """
-    header = int(header, 16)
-    validity = True
-
-    packet_type = (header >> 30) & 0b11
-    window = (header >> 24) & 0b111111
-    length = (header >> 11) & 0x1FFF
-    seqnum = header & 0x7FF
-
-    if packet_type == 1:
-        P_TYPE = "DATA"
-    elif packet_type == 2:
-        P_TYPE = "ACK"
-    elif packet_type == 3:
-        P_TYPE = "SACK"
-    else:
-        P_TYPE = None
-        validity = False
+    def __init__(self, init_rto=1.0):
+        self.srtt = None
+        self.rttvar= None
+        self.rto= init_rto
     
-    if length > 1024:
-        validity = False
+    def update(self, measured_rtt:float):
+        if self.srtt is None:
+            self.srtt = measured_rtt
+            self.rttvar=measured_rtt/2
+        else:
+            alpha= 0.125
+            beta= 0.25
+            diff = measured_rtt - self.srtt
+            self.srtt += alpha * diff
+            self.rttvar += beta * (abs(diff)-self.rttvar)
+        self.rto = self.srtt+4*self.rttvar
+        self.rto= max(0.2,min(2.0,self.rto))
+    
+    def get_rto(self) ->float:
+        return self.rto
 
-    return validity, P_TYPE, window, length, seqnum
+class SRTPClient:
+    def __init__(self, save_path:str):
+        self.save_path = save_path
+        self.sock= None
+        self.server_addr = None
 
-client_socket=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server_address= ("127.0.0.1", 12345)
-message="hi"
+        # State
+        self.next_seqnum=0
+        self.next_expected=0
+        self.window_size=10
 
-client_socket.sendto(message.encode(), server_address)
-data,server=client_socket.recvfrom(1024)
-print(f"Reponse serveur: {data.decode()}")
+        # Buffers
+        self.send_buffer = {}
+        self.rec_buffer= {}
+        self.pend_pack= {}
 
+        # Time
+        self.rtt_estimator=RTTEstimator()
 
+        # File handling
+        self.rec_data = bytearray()
+        self.transfer_complete = False
+        self.last_ack_sent = 0
+    
+    def get_timestamp(self) -> int:
+        return int(time.time()*1000) & 0xFFFFFFFF
+    
+    def connect(self, hostname: str, port: int, path: str):
 
-client_socket.close()
+        # Create IPv6 socket
+        self.sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        self.server_addr = (hostname, port)
+
+        # HTTP request
+        request = f"GET {path}\r\n".encode('ascii')
+
+        # Send request as DATA
+        self._send_data_packet(0,request)
+        self.pend_pack[0]={'send_time': time.time(),'payload': request,'retrans_count':0}
+
+        print(f"[CLIENT] Sent request for {path}", file=sys.stderr)
+
+        # Receive loop
+        self._receive_loop()
+
+    def _send_data_packet(self,seqnum:int, payload: bytes):
+
+        print(f"[DEBUG] Client sending ACK seqnum={seqnum}", file=sys.stderr)
+
+        packet = SRTPPacket(ptype=SRTPPacket.PTYPE_DATA,window=self.window_size,length=len(payload),seqnum=seqnum,timestamp=self.get_timestamp(),payload=payload)
+        self.sock.sendto(packet.encode(), self.server_addr)
+
+    def _send_ack(self, seqnum:int,data_timestamp:int):
+        packet = SRTPPacket(ptype=SRTPPacket.PTYPE_ACK,window=self.window_size,length=0,seqnum=seqnum,timestamp=data_timestamp,payload=b'')
+        self.sock.sendto(packet.encode(),self.server_addr)
+
+    def _receive_loop(self):
+        # Loop to handle incoming packets
+        self.sock.settimeout(0.1)
+
+        while not self.transfer_complete:
+            self._check_retransmission()
+
+            try:
+                data,addr = self.sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+
+            try:
+                packet = SRTPPacket.decode(data)
+            except ValueError as e:
+                print(f"[CLIENT] Invalid packet: {e}",file=sys.stderr)
+                continue
+
+            if packet.is_data():
+                self._handle_data_packet(packet)
+            elif packet.is_ack():
+                self._handle_ack_packet(packet)
+            elif packet.is_sack():
+                # For now, treat SACK as regular ACK because not implemented
+                print(f"[Client] Received SACK, treating as ACK", file=sys.stderr)
+                self._handle_ack_packet(packet)
+
+        with open(self.save_path,'wb') as f:
+            f.write(self.rec_data)
+        print(f"[Client] File saved to {self.save_path}", file=sys.stderr)
+
+    def _handle_data_packet(self,packet: SRTPPacket):
+        seqnum= packet.seqnum
+        payload = packet.payload
+        self.window_size=packet.window
+
+        print(f"[DEBUG] Client received DATA seq={seqnum}, len={len(payload)}", file=sys.stderr)
+        
+        if packet.is_end():
+            print(f"[CLIENT] Received last packet", file=sys.stderr)
+            self.transfer_complete = True
+            self._send_ack(seqnum+1,packet.timestamp)
+            return
+        
+        # Check if packet is in expected window
+        if seqnum >= self.next_expected and seqnum < self.next_expected+self.window_size:
+            self.rec_buffer[seqnum]=payload
+
+            while self.next_expected in self.rec_buffer:
+                self.rec_data.extend(self.rec_buffer[self.next_expected])
+                del self.rec_buffer[self.next_expected]
+                self.next_expected +=1
+
+                if self.next_expected >= SRTPPacket.MAX_SEQNUM:
+                    self.next_expected=0
+                
+            self._send_ack(self.next_expected, packet.timestamp)
+        elif seqnum < self.next_expected:
+            self._send_ack(self.next_expected, packet.timestamp)
+
+        else:
+            pass
+    
+    def _handle_ack_packet(self,packet : SRTPPacket):
+        ack_seq = packet.seqnum-1
+
+        if ack_seq in self.pend_pack:
+            packet_info = self.pend_pack[ack_seq]
+            measured_rtt = time.time()-packet_info['send_time']
+            self.rtt_estimator.update(measured_rtt)
+            del self.pend_pack[ack_seq]
+
+            self.next_seqnum=max(self.next_seqnum, ack_seq+1)
+    
+    def _check_retransmission(self):
+        current_time = time.time()
+        rto = self.rtt_estimator.get_rto()
+
+        for seqnum, info in list(self.pend_pack.items()):
+            if current_time - info['send_time'] > rto:
+                print(f"[CLIENT] Retransmitting packet {seqnum}", file=sys.stderr)
+                self._send_data_packet(seqnum,info['payload'])
+                info['send_time']=current_time
+                info['retrans_count']+=1
+
+                if info['retrans_count']>5:
+                    print(f"[CLIENT] Aborting packet",file=sys.stderr)
+                    sys.exit(1)
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+def parse_url(url: str): 
+    parsed= urllib.parse.urlparse(url)
+
+    if parsed.scheme != 'http':
+        raise ValueError({f"This {parsed.scheme} is not supported"})
+    
+    hostname=parsed.hostname
+    port = parsed.port if parsed.port else 80
+    path = parsed.path if parsed.path else '/'
+    return hostname,port,path
+
+def main():
+    parser = argparse.ArgumentParser(description='SRTP Client')
+    parser.add_argument('--save', dest='save_path',default='11m.model',help='Location received')
+    parser.add_argument('url', help='URL of the file (http://hostname:port/path/to/file)')
+
+    args = parser.parse_args()
+    try:
+        hostname,port,path = parse_url(args.url)
+    except Exception as e:
+        print(f"[CLIENT] Invalid URL: {e}",file=sys.stderr)
+        sys.exit(1)
+
+    client=SRTPClient(args.save_path)
+    try:
+        client.connect(hostname,port,path)
+    except Exception as e:
+        print(f"[CLIENT] Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        client.close()
+
+if __name__ == "__main__":
+    main()
