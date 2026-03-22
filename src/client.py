@@ -176,7 +176,7 @@ class SRTPClient:
                 info['send_time']=current_time
                 info['retrans_count']+=1
 
-                if info['retrans_count']>5:
+                if info['retrans_count']>10:
                     print(f"[CLIENT] Aborting packet",file=sys.stderr)
                     sys.exit(1)
 
