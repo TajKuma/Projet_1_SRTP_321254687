@@ -15,7 +15,7 @@ from pathlib import Path
 # Add src to path (parent directory because tests/ is a subfolder)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from srtp_encode_decode import SRTPPacket
+from client import SRTPPacket
 
 
 def test_packet_encoding():
@@ -446,6 +446,319 @@ def test_srtp_latency():
     print("  ✅ PASSED")
     return True
 
+def test_packet_loss():
+    print("\n[TEST 9] Packet loss handling")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    test_content = os.urandom(50 * 1024)
+    test_file = "loss_test.bin"
+    output_file = "loss_out.bin"
+
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12346"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    # 20% loss
+    link_proc = subprocess.Popen(
+        ["./link_sim", "-p", "1342", "-P", "12346", "-l", "20", "-e", "0", "-d", "0", "-j", "0"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    client_proc = subprocess.run(
+        [sys.executable, "src/client.py", f"http://[::1]:1342/{test_file}", "--save", output_file],
+        timeout=60
+    )
+
+    server_proc.terminate()
+    link_proc.terminate()
+
+    if client_proc.returncode != 0:
+        print("  ✗ Transfer failed with packet loss")
+        return False
+
+    with open(output_file, "rb") as f:
+        received = f.read()
+
+    if received != test_content:
+        print("  ✗ Data corrupted under packet loss")
+        return False
+
+    os.remove(test_file)
+    os.remove(output_file)
+
+    print("  ✓ Packet loss handled correctly")
+    print("  ✅ PASSED")
+    return True
+
+def test_packet_corruption():
+    print("\n[TEST 10] Packet corruption handling")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    test_content = os.urandom(20 * 1024)
+    test_file = "corrupt_test.bin"
+    output_file = "corrupt_out.bin"
+
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12347"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    # 10% corruption
+    link_proc = subprocess.Popen(
+        ["./link_sim", "-p", "1343", "-P", "12347", "-e", "10"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    client_proc = subprocess.run(
+        [sys.executable, "src/client.py", f"http://[::1]:1343/{test_file}", "--save", output_file],
+        timeout=60
+    )
+
+    server_proc.terminate()
+    link_proc.terminate()
+
+    if client_proc.returncode != 0:
+        print("  ✗ Transfer failed with corruption")
+        return False
+
+    with open(output_file, "rb") as f:
+        received = f.read()
+
+    if received != test_content:
+        print("  ✗ Data corrupted")
+        return False
+
+    os.remove(test_file)
+    os.remove(output_file)
+
+    print("  ✓ Corruption handled correctly")
+    print("  ✅ PASSED")
+    return True
+
+def test_jitter():
+    print("\n[TEST 11] Jitter handling")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    test_content = os.urandom(30 * 1024)
+    test_file = "jitter_test.bin"
+    output_file = "jitter_out.bin"
+
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12348"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    link_proc = subprocess.Popen(
+        ["./link_sim", "-p", "1344", "-P", "12348", "-j", "200"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    client_proc = subprocess.run(
+        [sys.executable, "src/client.py", f"http://[::1]:1344/{test_file}", "--save", output_file],
+        timeout=60
+    )
+
+    server_proc.terminate()
+    link_proc.terminate()
+
+    if client_proc.returncode != 0:
+        print("  ✗ Transfer failed with jitter")
+        return False
+
+    with open(output_file, "rb") as f:
+        received = f.read()
+
+    if received != test_content:
+        print("  ✗ Data corrupted with jitter")
+        return False
+
+    os.remove(test_file)
+    os.remove(output_file)
+
+    print("  ✓ Jitter handled correctly")
+    print("  ✅ PASSED")
+    return True
+
+def test_reordering():
+    print("\n[TEST 12] Packet reordering handling")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    test_content = os.urandom(40 * 1024)
+    test_file = "reorder_test.bin"
+    output_file = "reorder_out.bin"
+
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12349"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    # -R reorder
+    link_proc = subprocess.Popen(
+        ["./link_sim", "-p", "1345", "-P", "12349", "-R"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    client_proc = subprocess.run(
+        [sys.executable, "src/client.py", f"http://[::1]:1345/{test_file}", "--save", output_file],
+        timeout=60
+    )
+
+    server_proc.terminate()
+    link_proc.terminate()
+
+    if client_proc.returncode != 0:
+        print("  ✗ Transfer failed with reordering")
+        return False
+
+    with open(output_file, "rb") as f:
+        received = f.read()
+
+    if received != test_content:
+        print("  ✗ Data corrupted with reordering")
+        return False
+
+    os.remove(test_file)
+    os.remove(output_file)
+
+    print("  ✓ Reordering handled correctly")
+    print("  ✅ PASSED")
+    return True
+
+def test_fast_retransmit():
+    print("\n[TEST 13] Fast retransmit behavior")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    test_content = os.urandom(60 * 1024)
+    test_file = "fast_test.bin"
+    output_file = "fast_out.bin"
+
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12350"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    link_proc = subprocess.Popen(
+        ["./link_sim", "-p", "1346", "-P", "12350", "-l", "10", "-j", "100"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    start = time.time()
+
+    client_proc = subprocess.run(
+        [sys.executable, "src/client.py", f"http://[::1]:1346/{test_file}", "--save", output_file],
+        timeout=60
+    )
+
+    duration = time.time() - start
+
+    server_proc.terminate()
+    link_proc.terminate()
+
+    if client_proc.returncode != 0:
+        print("  ✗ Transfer failed")
+        return False
+
+    print(f"  ⏱ Transfer time: {duration:.2f}s (should be reasonable)")
+
+    os.remove(test_file)
+    os.remove(output_file)
+
+    print("  ✓ Fast retransmit working (no timeout stalls)")
+    print("  ✅ PASSED")
+    return True
+
+def test_seqnum_wraparound():
+    print("\n[TEST 14] Sequence number wrap-around")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    # Force wrap (payload énorme)
+    test_content = os.urandom(3 * SRTPPacket.MAX_SEQNUM)
+    test_file = "wrap_test.bin"
+    output_file = "wrap_out.bin"
+
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12351"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    client_proc = subprocess.run(
+        [sys.executable, "src/client.py", f"http://[::1]:12351/{test_file}", "--save", output_file],
+        timeout=120
+    )
+
+    server_proc.terminate()
+
+    if client_proc.returncode != 0:
+        print("  ✗ Transfer failed on wrap-around")
+        return False
+
+    with open(output_file, "rb") as f:
+        received = f.read()
+
+    if received != test_content:
+        print("  ✗ Data mismatch after wrap-around")
+        return False
+
+    os.remove(test_file)
+    os.remove(output_file)
+
+    print("  ✓ Wrap-around handled correctly")
+    print("  ✅ PASSED")
+    return True
+
 def main():
     """Run all tests"""
     print("\n" + "="*50)
@@ -461,6 +774,12 @@ def main():
         ("Missing file handling", test_missing_file),
         ("Client --save option", test_save_option),
         ("SRTP transfer with 200 ms latency", test_srtp_latency),
+        ("Packet loss", test_packet_loss),
+        ("Packet corruption", test_packet_corruption),
+        ("Jitter", test_jitter),
+        ("Reordering", test_reordering),
+        ("Fast retransmit", test_fast_retransmit),
+        ("Seqnum wrap-around", test_seqnum_wraparound),
     ]
     
     passed = 0

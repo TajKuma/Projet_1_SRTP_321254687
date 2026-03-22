@@ -1,20 +1,21 @@
-# See gcc/clang manual to understand all flags
-CFLAGS += -std=c99 # Define which version of the C standard to use
-CFLAGS += -Wall # Enable the 'all' set of warnings
-CFLAGS += -Werror # Treat all warnings as error
-CFLAGS += -Wshadow # Warn when shadowing variables
-CFLAGS += -Wextra # Enable additional warnings
-CFLAGS += -O2 -D_FORTIFY_SOURCE=2 # Add canary code, i.e. detect buffer overflows
-CFLAGS += -fstack-protector-all # Add canary code to detect stack smashing
-CFLAGS += -D_XOPEN_SOURCE -D_POSIX_C_SOURCE=201112L # getopt, clock_getttime
+CFLAGS += -std=c99
+CFLAGS += -Wall
+CFLAGS += -Werror
+CFLAGS += -Wshadow
+CFLAGS += -Wextra
+CFLAGS += -O2 -D_FORTIFY_SOURCE=2
+CFLAGS += -fstack-protector-all
+CFLAGS += -D_XOPEN_SOURCE -D_POSIX_C_SOURCE=201112L
 
 SOURCES=$(wildcard *.c)
 OBJECTS=$(SOURCES:.c=.o)
 
 LDFLAGS= -rdynamic
-ifneq ($(shell uname -s),Darwin) # Apple does not have clock_gettime
-	LDFLAGS += -lrt              # hence does not need librealtime
+ifneq ($(shell uname -s),Darwin)
+	LDFLAGS += -lrt
 endif
+
+.PHONY: all debug clean mrproper clean-tests clean-pycache clean-all rebuild test help
 
 all: link_sim
 
@@ -23,23 +24,14 @@ debug: LDFLAGS += -lSegFault
 debug: link_sim
 
 link_sim: $(OBJECTS)
+	$(CC) $(CFLAGS) $(OBJECTS) -o link_sim $(LDFLAGS)
 
-# Test files patterns (files created by tests)
-TEST_FILES = test_*.txt test_*.bin output_*.txt output_*.bin \
-             large_input.bin large_output.bin \
-             test_input.txt test_output.txt \
-             custom_output.txt missing_out.txt save_test.txt \
-             custom_location.model 11m.model \
-             test_perfect_*.bin test_latency_*.bin test_loss_*.bin \
-             output_perfect_*.bin output_latency_*.bin output_loss_*.bin \
-             performance_results.png \
-             *.log *.out core *.core
+# Python cache
+PYCACHE_DIRS = src/__pycache__ tests/__pycache__ __pycache__
+PYCACHE_FILES = src/*.pyc tests/*.pyc *.pyc
 
-# Python cache directories
-PYCACHE_DIRS = __pycache__ tests/__pycache__ src/__pycache__
-PYCACHE_FILES = *.pyc tests/*.pyc src/*.pyc
-
-.PHONY: clean mrproper rebuild clean-tests clean-all clean-pycache help
+# Test-generated files
+TEST_FILES = *.bin *.txt *.log *.out link_sim performance_results.png
 
 clean:
 	@rm -f $(OBJECTS)
@@ -50,19 +42,16 @@ mrproper:
 	@echo "  ✓ Binary removed"
 
 clean-pycache:
-	@echo "Removing Python cache files..."
+	@echo "Removing Python cache..."
 	@rm -rf $(PYCACHE_DIRS)
 	@rm -f $(PYCACHE_FILES)
-	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-	@find . -type f -name "*.pyc" -delete 2>/dev/null || true
 	@echo "  ✓ Python cache removed"
 
 clean-tests:
-	@echo "Cleaning test files..."
+	@echo "Removing test files..."
 	@rm -f $(TEST_FILES)
-	@rm -f $(addprefix tests/, $(TEST_FILES))
-	@rm -f $(addprefix src/, $(TEST_FILES))
-	@rm -f $(addprefix ../, $(TEST_FILES))
+	@rm -f tests/*.bin tests/*.txt tests/*.log tests/*.out
+	@rm -f src/*.bin src/*.txt src/*.log src/*.out
 	@echo "  ✓ Test files removed"
 
 clean-all: clean clean-tests clean-pycache mrproper
@@ -70,7 +59,13 @@ clean-all: clean clean-tests clean-pycache mrproper
 
 rebuild: clean mrproper link_sim
 
-# Help target to show available commands
+test: all
+	@echo "Running test_perf.py..."
+	@python3 tests/test_perf.py || exit 1
+	@echo "Running test_srtp.py..."
+	@python3 tests/test_srtp.py || exit 1
+	@echo "  ✓ All tests executed"
+
 help:
 	@echo "=========================================="
 	@echo "Available commands:"
@@ -79,8 +74,9 @@ help:
 	@echo "  make clean      - Remove object files only"
 	@echo "  make mrproper   - Remove link_sim binary only"
 	@echo "  make clean-pycache - Remove __pycache__ folders and .pyc files"
-	@echo "  make clean-tests - Remove all test files (outputs, temp files, etc.)"
+	@echo "  make clean-tests - Remove all test-generated files"
 	@echo "  make clean-all  - Remove everything (objects, binary, tests, cache)"
 	@echo "  make rebuild    - Rebuild link_sim from scratch"
 	@echo "  make debug      - Build with debug symbols"
+	@echo "  make test       - Compile and run all Python tests"
 	@echo "=========================================="
