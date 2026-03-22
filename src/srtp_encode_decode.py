@@ -3,7 +3,6 @@ import zlib
 from typing import Optional, Tuple
 
 class SRTPPacket:
-
     #Types (2 bits)
     PTYPE_DATA= 1
     PTYPE_ACK= 2
@@ -18,7 +17,6 @@ class SRTPPacket:
     CRC1_FORMAT= '!I'
 
     def __init__(self, ptype: int, window: int, length: int, seqnum: int, timestamp: int, payload: bytes=b''):
-
         self.ptype=ptype            #(1=DATA, 2=ACK, 3=SACK)
         self.window=window          #(0-63)
         self.length=length          #(0-1024)
@@ -27,6 +25,7 @@ class SRTPPacket:
         self.payload=payload        #(max 1024 bytes)
 
         self._check()
+
     def _check(self):
         #Check if any of the packet arg is wrong
         if self.ptype not in (self.PTYPE_DATA,self.PTYPE_ACK,self.PTYPE_SACK):
@@ -47,7 +46,6 @@ class SRTPPacket:
     
     def encode(self) -> bytes:
         #Encode the packet into bytes ready to be send
-
         header_no_crc = self._pack_header()
         timestamp_bt = struct.pack('!I',self.timestamp)
         header_no_crc += timestamp_bt
@@ -66,7 +64,6 @@ class SRTPPacket:
         
     @classmethod
     def decode(cls, data: bytes) -> 'SRTPPacket':
-
         if len(data)<12:
             raise ValueError(f"{len(data)}<12")
         
@@ -103,8 +100,10 @@ class SRTPPacket:
     
     def is_data(self) -> bool:
         return self.ptype == self.PTYPE_DATA
+
     def is_ack(self)->bool:
         return self.ptype == self.PTYPE_ACK
+
     def is_sack(self) -> bool:
         return self.ptype == self.PTYPE_SACK
     

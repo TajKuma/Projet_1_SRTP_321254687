@@ -44,6 +44,7 @@ def test_packet_encoding():
     print("  ✓ END packet detection")
     
     print("  ✅ PASSED")
+    return True
 
 
 def test_crc_error():
@@ -348,6 +349,102 @@ def test_save_option():
     print("  ✅ PASSED")
     return True
 
+def test_srtp_latency():
+    """Test SRTP transfer with 200 ms latency using link_sim, with timestamps and order check"""
+    print("\n[TEST 8] SRTP transfer with 200 ms latency")
+
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    os.chdir(project_root)
+
+    test_content = b"Testing latency handling in SRTP\n"
+    test_file = "latency_test.txt"
+    output_file = "latency_out.txt"
+
+    # Créer le fichier de test
+    tests_dir = os.path.join(project_root, "tests")
+    os.makedirs(tests_dir, exist_ok=True)
+    with open(os.path.join(tests_dir, test_file), "wb") as f:
+        f.write(test_content)
+
+    # Démarrer le serveur
+    server_proc = subprocess.Popen(
+        [sys.executable, "src/server.py", "::1", "12345", "--root", tests_dir],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    # Démarrer link_sim avec latence 200ms bidirectionnelle
+    link_proc = subprocess.Popen(
+        ["./link_sim", "-p", "1341", "-P", "12345", "-d", "200", "-j", "0", "-e", "0", "-c", "0", "-l", "0", "-R"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(1)
+
+    # Lancer le client et capturer stdout pour les séquences
+    timestamps = []
+    seq_order = []
+
+    start_time = time.time()
+    with subprocess.Popen(
+        [sys.executable, "src/client.py", f"http://[::1]:1341/{test_file}", "--save", output_file],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    ) as client_proc:
+        try:
+            for line in client_proc.stdout:
+                print(line, end="")  # afficher debug client
+                if "DEBUG] Client received DATA seq=" in line:
+                    seq = int(line.split("seq=")[1].split(",")[0])
+                    timestamps.append(time.time())
+                    seq_order.append(seq)
+
+            client_proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            print("  ✗ Client timed out")
+            server_proc.terminate()
+            link_proc.terminate()
+            return False
+    end_time = time.time()
+
+    # Arrêter serveur et link_sim
+    server_proc.terminate()
+    server_proc.wait()
+    link_proc.terminate()
+    link_proc.wait()
+
+    # Vérifier le résultat du fichier
+    if client_proc.returncode != 0:
+        print(f"  ✗ Client failed")
+        return False
+    if not os.path.exists(output_file):
+        print("  ✗ Output file not created")
+        return False
+    with open(output_file, "rb") as f:
+        received = f.read()
+    if received != test_content:
+        print("  ✗ File content mismatch")
+        return False
+
+    # Vérifier l'ordre des paquets
+    if seq_order != sorted(seq_order):
+        print("  ✗ Packets received out of order")
+        return False
+
+    # Afficher timestamps et temps total
+    print(f"  ⏱ Total transfer time: {end_time - start_time:.3f} s")
+    for i, t in enumerate(timestamps):
+        print(f"    Packet seq={seq_order[i]} received at {t - start_time:.3f} s")
+
+    # Cleanup
+    os.remove(os.path.join(tests_dir, test_file))
+    os.remove(output_file)
+
+    print("  ✓ File transferred correctly with 200 ms latency, correct order")
+    print("  ✅ PASSED")
+    return True
 
 def main():
     """Run all tests"""
@@ -363,6 +460,7 @@ def main():
         ("Server --root option", test_root_directory),
         ("Missing file handling", test_missing_file),
         ("Client --save option", test_save_option),
+        ("SRTP transfer with 200 ms latency", test_srtp_latency),
     ]
     
     passed = 0

@@ -123,10 +123,15 @@ class SRTPClient:
 
         print(f"[DEBUG] Client received DATA seq={seqnum}, len={len(payload)}", file=sys.stderr)
         
-        if packet.is_end():
+        if packet.length == 0 and seqnum == self.next_expected:
             print(f"[CLIENT] Received last packet", file=sys.stderr)
+
+            if len(self.rec_data) == 0:
+                print("[CLIENT] File not found", file=sys.stderr)
+                sys.exit(1)
+
             self.transfer_complete = True
-            self._send_ack(seqnum+1,packet.timestamp)
+            self._send_ack(seqnum + 1, packet.timestamp)
             return
         
         # Check if packet is in expected window
@@ -149,15 +154,16 @@ class SRTPClient:
             pass
     
     def _handle_ack_packet(self,packet : SRTPPacket):
-        ack_seq = packet.seqnum-1
+        ack_seq = packet.seqnum
 
-        if ack_seq in self.pend_pack:
-            packet_info = self.pend_pack[ack_seq]
-            measured_rtt = time.time()-packet_info['send_time']
-            self.rtt_estimator.update(measured_rtt)
-            del self.pend_pack[ack_seq]
+        for seq in list(self.pend_pack.keys()):
+            if seq < ack_seq:
+                packet_info = self.pend_pack[seq]
+                measured_rtt = time.time() - packet_info['send_time']
+                self.rtt_estimator.update(measured_rtt)
+                del self.pend_pack[seq]
 
-            self.next_seqnum=max(self.next_seqnum, ack_seq+1)
+        self.next_seqnum = max(self.next_seqnum, ack_seq)
     
     def _check_retransmission(self):
         current_time = time.time()

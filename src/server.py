@@ -159,12 +159,17 @@ class SRTPFileServer:
         
         self._send_window(addr)
 
-    def _send_window(self,addr):
+    def _send_window(self, addr):
         client = self.clients[addr]
 
-        for seqnum in range(client.base_seqnum, min(client.base_seqnum + client.window_size, client.next_seqnum)):
-            if seqnum in client.send_buffer and seqnum not in client.pend_pack:
-                self._send_data_packet(addr,seqnum,client.send_buffer[seqnum])
+        while len(client.pend_pack) < client.window_size:
+            seq = client.base_seqnum + len(client.pend_pack)
+
+            if seq >= client.next_seqnum:
+                break
+
+            if seq not in client.pend_pack:
+                self._send_data_packet(addr, seq, client.send_buffer[seq])
 
     def _send_data_packet(self,addr,seqnum:int,payload:bytes):
         client=self.clients[addr]
@@ -206,18 +211,19 @@ class SRTPFileServer:
         if not client:
             return
         
-        ack_seq = packet.seqnum - 1
-        print(f"[DEBUG] Server received ACK for seq={ack_seq}", file=sys.stderr)
+        ack_seq = packet.seqnum
+        print(f"[DEBUG] Server received ACK up to seq={ack_seq}", file=sys.stderr)
 
-        if ack_seq in client.pend_pack:
-            packet_info = client.pend_pack[ack_seq]
-            measured_rtt = time.time() - packet_info['send_time']
-            client.rtt_estimator.update(measured_rtt)
-            del client.pend_pack[ack_seq]
+        for seq in list(client.pend_pack.keys()):
+            if seq < ack_seq:
+                packet_info = client.pend_pack[seq]
+                measured_rtt = time.time() - packet_info['send_time']
+                client.rtt_estimator.update(measured_rtt)
+                del client.pend_pack[seq]
 
-            client.base_seqnum = max(client.base_seqnum, ack_seq + 1)
+        client.base_seqnum = max(client.base_seqnum, ack_seq)
 
-            self._send_window(addr)
+        self._send_window(addr)
 
         # Check if all DATA have been sent and acknowledged
         all_data_sent = client.base_seqnum >= client.next_seqnum
