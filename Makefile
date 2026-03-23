@@ -36,26 +36,22 @@ TEST_FILES = *.bin *.txt *.log *.out link_sim performance_results.png
 clean:
 	@rm -f $(OBJECTS)
 	@echo "  ✓ Object files removed"
-
-mrproper:
-	@rm -f link_sim
-	@echo "  ✓ Binary removed"
-
-clean-pycache:
+	@echo "  ✓ All files cleaned"
 	@echo "Removing Python cache..."
 	@rm -rf $(PYCACHE_DIRS)
 	@rm -f $(PYCACHE_FILES)
 	@echo "  ✓ Python cache removed"
-
-clean-tests:
 	@echo "Removing test files..."
 	@rm -f $(TEST_FILES)
 	@rm -f tests/*.bin tests/*.txt tests/*.log tests/*.out
 	@rm -f src/*.bin src/*.txt src/*.log src/*.out
 	@echo "  ✓ Test files removed"
+	
+mrproper:
+	@rm -f link_sim
+	@echo "  ✓ Binary removed"
 
-clean-all: clean clean-tests clean-pycache mrproper
-	@echo "  ✓ All files cleaned"
+
 
 rebuild: clean mrproper link_sim
 
