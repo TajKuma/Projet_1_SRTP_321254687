@@ -1,6 +1,4 @@
 import argparse
-import struct
-import zlib
 import threading
 import socket
 import sys
@@ -9,62 +7,48 @@ import os
 from srtp_encode_decode import SRTPPacket
 
 
-class SRTPReceiver:
-    def __init__(self, sock: socket.socket, app_callback, init_window=64):
+class SRTPClientHandler(threading.Thread):
+    def __init__(self, sock: socket.socket, client: ClientState):
+        super().__init__(daemon=True)
         self.sock = sock
-        self.app_callback = app_callback
-        self.recv_buffer = {}  # seqnum -> SRTPPacket
-        self.expected_seqnum = 0
-        self.window_size = init_window
-        self.last_ack_sent = -1
-        self.lock = threading.Lock()
-        self.stop_flag = False
+        self.client = client
 
-    def start(self):
-        threading.Thread(target=self._recv_loop, daemon=True).start()
+    def run(self):
+        while not self.client.stop_flag:
+            self.send_window()
+            self.retransmit_if_needed()
+            time.sleep(0.05)
 
-    def _recv_loop(self):
-        while not self.stop_flag:
-            try:
-                data, addr = self.sock.recvfrom(1500)
-                try:
-                    pkt = SRTPPacket.decode(data)
-                except ValueError:
-                    continue  # corrupted/truncated, ignore
+    def send_window(self):
+        with self.client.lock:
+            while len(self.client.pend_pack) < self.client.window_size:
+                seq = self.client.base_seqnum + len(self.client.pend_pack)
+                if seq >= self.client.next_seqnum:
+                    break
+                if seq not in self.client.pend_pack:
+                    payload = self.client.send_buffer[seq]
+                    self.send_data_packet(seq, payload)
 
-                if pkt.is_data():
-                    self._process_data(pkt, addr)
-            except socket.timeout:
-                continue
+    def send_data_packet(self, seqnum: int, payload: bytes):
+        timestamp = int(time.time() * 1000) & 0xFFFFFFFF
+        packet = SRTPPacket(
+            ptype=SRTPPacket.PTYPE_DATA,
+            window=self.client.window_size,
+            length=len(payload),
+            seqnum=seqnum,
+            timestamp=timestamp,
+            payload=payload
+        )
+        self.sock.sendto(packet.encode(), self.client.addr)
+        self.client.pend_pack[seqnum] = {'send_time': time.time(), 'payload': payload}
 
-    def _process_data(self, pkt: SRTPPacket, addr):
-        seq = pkt.seqnum
-        with self.lock:
-            if not seqnum_in_window(seq, self.expected_seqnum, self.window_size):
-                # Outside window, ignore
-                return
-
-            # Buffer packet if not duplicate
-            if seq not in self.recv_buffer:
-                if pkt.length > 0:
-                    self.recv_buffer[seq] = pkt
-                elif pkt.is_end():
-                    # EOF
-                    self.recv_buffer[seq] = pkt
-
-            # Deliver in-order packets to application
-            while self.expected_seqnum in self.recv_buffer:
-                p = self.recv_buffer.pop(self.expected_seqnum)
-                if p.length > 0:
-                    self.app_callback(p.payload)
-                self.expected_seqnum = (self.expected_seqnum + 1) % SRTPPacket.MAX_SEQNUM
-
-            # Send cumulative ACK
-            ack_pkt = SRTPPacket(SRTPPacket.PTYPE_ACK, self.window_size,
-                                 0, self.expected_seqnum, pkt.timestamp)
-            self.sock.sendto(ack_pkt.encode(), addr)
-            self.last_ack_sent = self.expected_seqnum
-            
+    def retransmit_if_needed(self):
+        now = time.time()
+        with self.client.lock:
+            for seqnum, info in list(self.client.pend_pack.items()):
+                if now - info['send_time'] > self.client.rtt_estimator.get_rto():
+                    self.send_data_packet(seqnum, info['payload'])
+                    info['send_time'] = now
 class RTTEstimator:
 
     def __init__(self,init_rto=1.0):
@@ -101,10 +85,9 @@ class ClientState:
         self.send_buffer={}
         self.pend_pack={}
         self.rtt_estimator= RTTEstimator()
-        self.trans_active = True
         self.end_sent = False
-        self.last_ack_received=0
-        self.last_timestamp=0
+        self.lock = threading.Lock()
+        self.stop_flag = False
 
 class SRTPFileServer:
     def __init__(self,hostname:str,port:int,root_dir:str):
@@ -118,18 +101,14 @@ class SRTPFileServer:
         # Start the server
         self.sock = socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)
         self.sock.bind((self.hostname,self.port))
-
+        self.sock.settimeout(0.1)
         print(f"[Server] Listening on {self.hostname}:{self.port}",file=sys.stderr)
         print(f"[Server] Root directory: {self.root_dir}",file=sys.stderr)
 
         self._run()
 
     def _run(self):
-        self.sock.settimeout(0.1)
-
         while True:
-            self._check_all_retransmissions()
-
             try:
                 data, addr = self.sock.recvfrom(4096)
             except socket.timeout:
@@ -142,107 +121,68 @@ class SRTPFileServer:
                 continue
 
             if addr not in self.clients:
-                self.clients[addr]= ClientState(addr)
+                client = ClientState(addr)
+                self.clients[addr] = client
+                handler = SRTPClientHandler(self.sock, client)
+                client.handler = handler
+                handler.start()
+            else:
+                client = self.clients[addr]
 
             if packet.is_data():
-                self._handle_data_packet(addr,packet)
-            elif packet.is_ack():
-                self._handle_ack_packet(addr,packet)
-            elif packet.is_sack():
-                # Treated as ACK for the moment
-                self._handle_ack_packet(addr,packet)
-            
-    def _handle_data_packet(self, addr, packet: SRTPPacket):
-        client = self.clients[addr]
+                self._handle_data_packet(client, packet)
+            elif packet.is_ack() or packet.is_sack():
+                self.handle_ack_packet(client, packet)
 
-        try:
+    def _handle_data_packet(self, client: ClientState, packet: SRTPPacket):
+        if client.file_data is None:
             request = packet.payload.decode('ascii')
             print(f"[DEBUG] Server received request: '{request}'", file=sys.stderr)
-        except UnicodeDecodeError:
-            print(f"[SERVER] Invalid request from {addr}", file=sys.stderr)
-            self._send_error_close(addr, packet)
-            return
-        
-        # Get the HTTP 0.9 path
-        if request.startswith('GET '):
-            path = request[4:].strip()
-            # Remove the \r\n if present
-            path = path.replace('\r', '').replace('\n', '')
-            # Remove the initial '/' if it exists
-            if path.startswith('/'):
-                path = path[1:]
-            print(f"[DEBUG] Server parsed path: '{path}'", file=sys.stderr)
-        else:
-            print(f"[SERVER] Not a GET request", file=sys.stderr)
-            self._send_error_close(addr, packet)
-            return
-        
-        file_path = os.path.join(self.root_dir, path)
-        print(f"[DEBUG] Full file path: '{file_path}'", file=sys.stderr)
+            if not request.startswith("GET "):
+                self._send_end(client)
+                return
+            path = request[4:].strip().lstrip('/')
+            file_path = os.path.join(self.root_dir, path)
+            try:
+                with open(file_path, 'rb') as f:
+                    client.file_data = f.read()
+                    client.file_size = len(client.file_data)
+            except FileNotFoundError:
+                self._send_end(client)
+                return
 
-        self._send_ack(addr, packet.seqnum + 1, packet.timestamp)
 
-        try:
-            with open(file_path, 'rb') as f:
-                client.file_data = f.read()
-                client.file_size = len(client.file_data)
+            offset= 0
+            seqnum = 0
 
-            print(f"[SERVER] Serving {file_path} ({client.file_size} bytes) to {addr}", file=sys.stderr)
-            
-            self._send_file_data(addr)
-        except FileNotFoundError:
-            print(f"[Server] File not Found: {file_path}", file=sys.stderr)
-            self._send_end(addr)
-            del self.clients[addr]
+            while offset < client.file_size:
+                chunk = client.file_data[offset:offset + SRTPPacket.MAX_PAYLOAD]
+                client.send_buffer[seqnum]=chunk
+                
+                print(f"[DEBUG] Server added chunk seq={seqnum}, size={len(chunk)}", file=sys.stderr)
 
-    def _send_file_data(self, addr):
-        client =self.clients[addr]
+                offset += len(chunk)
+                seqnum = (seqnum + 1) % SRTPPacket.MAX_SEQNUM
 
-        offset=0
-        seqnum = 0
+            client.next_seqnum = len(client.send_buffer)
+            print(f"[DEBUG] Server total chunks: {client.next_seqnum}", file=sys.stderr)
 
-        while offset < client.file_size:
-            chunk = client.file_data[offset:offset + SRTPPacket.MAX_PAYLOAD]
-            client.send_buffer[seqnum]=chunk
+        self._send_ack(client, packet.seqnum + 1, packet.timestamp)
 
-            print(f"[DEBUG] Server added chunk seq={seqnum}, size={len(chunk)}", file=sys.stderr)
-            
-            offset += len(chunk)
-            seqnum += 1
+    def handle_ack_packet(self, client: ClientState, packet: SRTPPacket):
+        ack_seq = packet.seqnum
+        with client.lock:
+            for seq in list(client.pend_pack.keys()):
+                if seq < ack_seq:
+                    measured_rtt = time.time() - client.pend_pack[seq]['send_time']
+                    client.rtt_estimator.update(measured_rtt)
+                    del client.pend_pack[seq]
+            client.base_seqnum = max(client.base_seqnum, ack_seq)
+            if client.base_seqnum >= client.next_seqnum and not client.end_sent:
+                self._send_end(client)
 
-            if seqnum >= SRTPPacket.MAX_SEQNUM:
-                seqnum=0
-            
-        client.next_seqnum = len(client.send_buffer)
-
-        print(f"[DEBUG] Server total chunks: {client.next_seqnum}", file=sys.stderr)
-        
-        self._send_window(addr)
-
-    def _send_window(self, addr):
-        client = self.clients[addr]
-
-        while len(client.pend_pack) < client.window_size:
-            seq = client.base_seqnum + len(client.pend_pack)
-
-            if seq >= client.next_seqnum:
-                break
-
-            if seq not in client.pend_pack:
-                self._send_data_packet(addr, seq, client.send_buffer[seq])
-
-    def _send_data_packet(self,addr,seqnum:int,payload:bytes):
-        client=self.clients[addr]
-
-        timestamp= int(time.time()*1000) & 0xFFFFFFFF
-
-        packet = SRTPPacket(ptype=SRTPPacket.PTYPE_DATA,window=client.window_size,length=len(payload),seqnum=seqnum,timestamp=timestamp,payload=payload)
-        self.sock.sendto(packet.encode(),addr)
-
-        client.pend_pack[seqnum]={'send_time': time.time(),'payload':payload}
-
-    def _send_ack(self, addr, seqnum: int, data_timestamp: int):
-        print(f"[DEBUG] Server sending ACK seqnum={seqnum} to {addr}", file=sys.stderr)
+    def _send_ack(self, client: ClientState, seqnum: int, data_timestamp: int):
+        print(f"[DEBUG] Server sending ACK seqnum={seqnum} to {client.addr}", file=sys.stderr)
         packet = SRTPPacket(
             ptype=SRTPPacket.PTYPE_ACK,
             window=10,
@@ -251,81 +191,21 @@ class SRTPFileServer:
             timestamp=data_timestamp,
             payload=b''
         )
-        self.sock.sendto(packet.encode(), addr)
-    def _send_end(self,addr):
-        client= self.clients.get(addr)
-        if not client:
-            return
-        
+        self.sock.sendto(packet.encode(), client.addr)
+    def _send_end(self,client:ClientState):
         timestamp= int(time.time()*1000) & 0xFFFFFFFF
         end_seqnum = client.next_seqnum
 
         packet = SRTPPacket(ptype= SRTPPacket.PTYPE_DATA,window=client.window_size,
                             length=0,seqnum=end_seqnum,timestamp=timestamp,payload=b'')
-        self.sock.sendto(packet.encode(),addr)
+        self.sock.sendto(packet.encode(),client.addr)
         client.end_sent = True
-        print(f"[SERVER] Sent END to {addr}",file=sys.stderr)
-
-    def _handle_ack_packet(self, addr, packet: SRTPPacket):
-        client = self.clients.get(addr)
-        if not client:
-            return
-        
-        ack_seq = packet.seqnum
-        print(f"[DEBUG] Server received ACK up to seq={ack_seq}", file=sys.stderr)
-
-        for seq in list(client.pend_pack.keys()):
-            if seq < ack_seq:
-                packet_info = client.pend_pack[seq]
-                measured_rtt = time.time() - packet_info['send_time']
-                client.rtt_estimator.update(measured_rtt)
-                del client.pend_pack[seq]
-
-        client.base_seqnum = max(client.base_seqnum, ack_seq)
-
-        self._send_window(addr)
-
-        # Check if all DATA have been sent and acknowledged
-        all_data_sent = client.base_seqnum >= client.next_seqnum
-        all_data_acked = not client.pend_pack
-        
-        # If all DATA are sent and acknowledged, and we haven't sent END yet
-        if all_data_sent and all_data_acked and not client.end_sent:
-            print(f"[SERVER] All data acked, sending END to {addr}", file=sys.stderr)
-            self._send_end(addr)
-        
-        # If END has been sent and everything is acknowledged, terminate
-        if client.end_sent and not client.pend_pack and client.base_seqnum >= client.next_seqnum:
-            print(f"[SERVER] Transfer complete for {addr}", file=sys.stderr)
-            del self.clients[addr]
-
-    def _check_all_retransmissions(self):
-        current_time = time.time()
-
-        for addr, client in list(self.clients.items()):
-            for seqnum, info in list(client.pend_pack.items()):
-                rto = client.rtt_estimator.get_rto()
-                if current_time - info['send_time'] > rto:
-                    print(f"[SERVER] Retransmitting packet {seqnum} to {addr}",file=sys.stderr)
-                    self._send_data_packet(addr,seqnum,info['payload'])
-                    info['send_time']=current_time
-    
-    def _send_error_close(self,addr, packet: SRTPPacket):
-        self._send_end(addr)
-        if addr in self.clients:
-            del self.clients[addr] 
-    
+        client.stop_flag = True
+        print(f"[Server] Sent END to {client.addr}", file=sys.stderr)
     def stop(self):
         if self.sock:
             self.sock.close()
 
-def seqnum_in_window(seq, base, window, max_seq=SRTPPacket.MAX_SEQNUM):
-    """Check if seq is in [base, base+window) modulo max_seq"""
-    if base + window < max_seq:
-        return base <= seq < base + window
-    else:
-        # wrap-around case
-        return seq >= base or seq < (base + window) % max_seq
 
 def main():
     parser = argparse.ArgumentParser(description="SRTP Server")
