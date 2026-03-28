@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import threading
 import socket
@@ -6,6 +7,48 @@ import time
 import os
 from srtp_encode_decode import SRTPPacket
 
+MAX_TIMEOUT = 2.0
+MIN_TIMEOUT = 0.2
+
+class RTTEstimator:
+    def __init__(self,init_rto=1.0):
+        self.srtt = None
+        self.rttvar = None
+        self.rto=init_rto
+
+    def update(self, measured_rtt:float):
+
+        if self.srtt is None:
+            self.srtt = measured_rtt
+            self.rttvar = measured_rtt / 2
+        else:
+            alpha = 0.125
+            beta = 0.25
+            diff = measured_rtt - self.srtt
+            self.srtt += alpha * diff
+            self.rttvar += beta * (abs(diff) - self.rttvar)
+        self.rto = self.srtt + 4 * self.rttvar
+        self.rto = max(MIN_TIMEOUT, min(MAX_TIMEOUT, self.rto))
+
+    def get_rto(self) -> float:
+        return self.rto
+
+class ClientState:
+
+    def __init__(self, addr):
+        self.addr= addr
+        self.file_data= None
+        self.file_size=0
+        self.next_seqnum=0
+        self.base_seqnum=0
+        self.window_size=10
+        self.send_buffer={}
+        self.pend_pack={}
+        self.rtt_estimator= RTTEstimator()
+        self.end_sent = False
+        self.lock = threading.Lock()
+        self.stop_flag = False
+        self.handler = None
 
 class SRTPClientHandler(threading.Thread):
     def __init__(self, sock: socket.socket, client: ClientState):
@@ -17,7 +60,7 @@ class SRTPClientHandler(threading.Thread):
         while not self.client.stop_flag:
             self.send_window()
             self.retransmit_if_needed()
-            time.sleep(0.05)
+            time.sleep(0.01)
 
     def send_window(self):
         with self.client.lock:
@@ -25,9 +68,10 @@ class SRTPClientHandler(threading.Thread):
                 seq = self.client.base_seqnum + len(self.client.pend_pack)
                 if seq >= self.client.next_seqnum:
                     break
-                if seq not in self.client.pend_pack:
+                seq_mod = seq % SRTPPacket.MAX_SEQNUM
+                if seq_mod not in self.client.pend_pack:
                     payload = self.client.send_buffer[seq]
-                    self.send_data_packet(seq, payload)
+                    self.send_data_packet(seq_mod, payload)
 
     def send_data_packet(self, seqnum: int, payload: bytes):
         timestamp = int(time.time() * 1000) & 0xFFFFFFFF
@@ -49,45 +93,6 @@ class SRTPClientHandler(threading.Thread):
                 if now - info['send_time'] > self.client.rtt_estimator.get_rto():
                     self.send_data_packet(seqnum, info['payload'])
                     info['send_time'] = now
-class RTTEstimator:
-
-    def __init__(self,init_rto=1.0):
-        self.srtt = None
-        self.rttvar= None
-        self.rto=init_rto
-
-    def update(self, measured_rtt:float):
-
-        if self.srtt is None:
-            self.srtt=measured_rtt
-            self.rttvar=measured_rtt/2
-        else:
-            alpha= 0.125
-            beta= 0.25
-            diff = measured_rtt - self.srtt
-            self.srtt += alpha * diff
-            self.rttvar += beta * (abs(diff)-self.rttvar)
-        self.rto = self.srtt+4*self.rttvar
-        self.rto= max(0.2,min(2.0,self.rto))
-    
-    def get_rto(self) ->float:
-        return self.rto
-    
-class ClientState:
-
-    def __init__(self, addr):
-        self.addr= addr
-        self.file_data= None
-        self.file_size=0
-        self.next_seqnum=0
-        self.base_seqnum=0
-        self.window_size=10
-        self.send_buffer={}
-        self.pend_pack={}
-        self.rtt_estimator= RTTEstimator()
-        self.end_sent = False
-        self.lock = threading.Lock()
-        self.stop_flag = False
 
 class SRTPFileServer:
     def __init__(self,hostname:str,port:int,root_dir:str):
@@ -96,12 +101,13 @@ class SRTPFileServer:
         self.root_dir=root_dir
         self.sock=None
         self.clients = {}
+        self.lock = threading.Lock()
 
     def start(self):
         # Start the server
         self.sock = socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)
         self.sock.bind((self.hostname,self.port))
-        self.sock.settimeout(0.1)
+        self.sock.settimeout(0.05)
         print(f"[Server] Listening on {self.hostname}:{self.port}",file=sys.stderr)
         print(f"[Server] Root directory: {self.root_dir}",file=sys.stderr)
 
@@ -116,27 +122,28 @@ class SRTPFileServer:
 
             try:
                 packet = SRTPPacket.decode(data)
-            except ValueError as e:
+            except ValueError:
                 print(f"[Server] Invalid packet from {addr}: {e}",file=sys.stderr)
                 continue
 
-            if addr not in self.clients:
-                client = ClientState(addr)
-                self.clients[addr] = client
-                handler = SRTPClientHandler(self.sock, client)
-                client.handler = handler
-                handler.start()
-            else:
-                client = self.clients[addr]
+            with self.lock:
+                if addr not in self.clients:
+                    client = ClientState(addr)
+                    self.clients[addr] = client
+                    handler = SRTPClientHandler(self.sock, client)
+                    client.handler = handler
+                    handler.start()
+                else:
+                    client = self.clients[addr]
 
             if packet.is_data():
                 self._handle_data_packet(client, packet)
             elif packet.is_ack() or packet.is_sack():
-                self.handle_ack_packet(client, packet)
+                self._handle_ack(client, packet)
 
     def _handle_data_packet(self, client: ClientState, packet: SRTPPacket):
         if client.file_data is None:
-            request = packet.payload.decode('ascii')
+            request = packet.payload.decode('ascii', errors='ignore')
             print(f"[DEBUG] Server received request: '{request}'", file=sys.stderr)
             if not request.startswith("GET "):
                 self._send_end(client)
@@ -162,18 +169,18 @@ class SRTPFileServer:
                 print(f"[DEBUG] Server added chunk seq={seqnum}, size={len(chunk)}", file=sys.stderr)
 
                 offset += len(chunk)
-                seqnum = (seqnum + 1) % SRTPPacket.MAX_SEQNUM
-
+                seqnum += 1
             client.next_seqnum = len(client.send_buffer)
             print(f"[DEBUG] Server total chunks: {client.next_seqnum}", file=sys.stderr)
 
         self._send_ack(client, packet.seqnum + 1, packet.timestamp)
 
-    def handle_ack_packet(self, client: ClientState, packet: SRTPPacket):
+    def _handle_ack(self, client: ClientState, packet: SRTPPacket):
         ack_seq = packet.seqnum
         with client.lock:
             for seq in list(client.pend_pack.keys()):
-                if seq < ack_seq:
+                if (seq - client.base_seqnum + SRTPPacket.MAX_SEQNUM) % SRTPPacket.MAX_SEQNUM < \
+                   (ack_seq - client.base_seqnum + SRTPPacket.MAX_SEQNUM) % SRTPPacket.MAX_SEQNUM:
                     measured_rtt = time.time() - client.pend_pack[seq]['send_time']
                     client.rtt_estimator.update(measured_rtt)
                     del client.pend_pack[seq]
@@ -181,20 +188,20 @@ class SRTPFileServer:
             if client.base_seqnum >= client.next_seqnum and not client.end_sent:
                 self._send_end(client)
 
-    def _send_ack(self, client: ClientState, seqnum: int, data_timestamp: int):
+    def _send_ack(self, client: ClientState, seqnum: int, timestamp: int):
         print(f"[DEBUG] Server sending ACK seqnum={seqnum} to {client.addr}", file=sys.stderr)
         packet = SRTPPacket(
             ptype=SRTPPacket.PTYPE_ACK,
-            window=10,
+            window=client.window_size,
             length=0,
             seqnum=seqnum,
-            timestamp=data_timestamp,
+            timestamp=timestamp,
             payload=b''
         )
         self.sock.sendto(packet.encode(), client.addr)
     def _send_end(self,client:ClientState):
         timestamp= int(time.time()*1000) & 0xFFFFFFFF
-        end_seqnum = client.next_seqnum
+        end_seqnum = client.next_seqnum % SRTPPacket.MAX_SEQNUM
 
         packet = SRTPPacket(ptype= SRTPPacket.PTYPE_DATA,window=client.window_size,
                             length=0,seqnum=end_seqnum,timestamp=timestamp,payload=b'')
